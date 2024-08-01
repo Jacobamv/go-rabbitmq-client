@@ -29,7 +29,7 @@ go mod tidy
 or you can just simply download 
 ```bash
 go get "github.com/Jacobamv/go-rabbitmq-client"
-``
+```
 
 ## Usage
 
