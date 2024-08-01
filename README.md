@@ -1,6 +1,3 @@
-Certainly! Let's create a concise and informative `readme.md` for the **go-rabbitmq-client** utility in Go. Here you go:
-
----
 
 # go-rabbitmq-client
 
