@@ -18,8 +18,18 @@ it based on github.com/rabbitmq/amqp091-go library
 To use go-rabbitmq-client in your Go project, simply import it:
 
 ```go
-import "github.com/Jacobamv/go-rabbitmq-client"
+import rabbitmq "github.com/Jacobamv/go-rabbitmq-client"
 ```
+and then you can download package by
+
+```bash
+go mod tidy
+```
+
+or you can just simply download 
+```bash
+go get "github.com/Jacobamv/go-rabbitmq-client"
+``
 
 ## Usage
 
