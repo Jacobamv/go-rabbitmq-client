@@ -21,6 +21,7 @@ type provider struct {
 type Client interface {
 	Consume(queueName string, consumer func([]byte) error)
 	Run()
+	Send(messageData []byte, queueName string) (err error)
 }
 
 type Connection interface {
@@ -196,4 +197,40 @@ func republishMessage(ch *amqp.Channel, msg amqp.Delivery, queueName string) err
 			ContentType: "application/json",
 			Body:        msg.Body,
 		})
+}
+
+func (p *provider) Send(messageData []byte, queueName string) (err error) {
+
+	q, err := p.Channel.QueueDeclare(
+		queueName, // name
+		false,     // durable
+		false,     // delete when unused
+		false,     // exclusive
+		false,     // no-wait
+		nil,       // arguments
+	)
+
+	if err != nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err = p.Channel.PublishWithContext(ctx,
+		"",     // exchange
+		q.Name, // routing key
+		false,  // mandatory
+		false,  // immediate
+		amqp.Publishing{
+			ContentType: "application/json",
+			Body:        messageData,
+		})
+
+	if err != nil {
+		return
+	}
+
+	return
+
 }
