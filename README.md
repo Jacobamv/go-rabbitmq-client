@@ -19,8 +19,6 @@ To use go-rabbitmq-client in your Go project, simply import it:
 import "github.com/Jacobamv/go-rabbitmq-client"
 ```
 
-Make sure to replace `Jacobamv` with your actual GitHub username or the appropriate module path.
-
 ## Usage
 
 Here's a basic example of how to use go-rabbitmq-client:
