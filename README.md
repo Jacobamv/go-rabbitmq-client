@@ -30,7 +30,7 @@ package main
 
 import (
 	"fmt"
-	rabbitmq "https://github.com/Jacobamv/go-rabbitmq-client"
+	rabbitmq "github.com/Jacobamv/go-rabbitmq-client"
 )
 
 func Test(msg []byte) error {
