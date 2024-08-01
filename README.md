@@ -3,6 +3,8 @@
 
 **go-rabbitmq-client** is a lightweight Go library for interacting with RabbitMQ. It provides features like auto-reconnect and panic handling, making it a reliable choice for RabbitMQ communication.
 
+it based on github.com/rabbitmq/amqp091-go library
+
 ## Features
 
 1. **Autoconnect**: The library automatically reconnects to the RabbitMQ server if the connection is lost. This ensures that your application remains resilient even in the face of network interruptions or RabbitMQ server restarts.
