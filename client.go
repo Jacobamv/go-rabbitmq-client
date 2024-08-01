@@ -19,8 +19,10 @@ type provider struct {
 }
 
 type Client interface {
-	Consume(queueName string, consumer func([]byte) error)
 	Run()
+	Close() (err error)
+
+	Consume(queueName string, consumer func([]byte) error)
 	Send(messageData []byte, queueName string) (err error)
 }
 
@@ -233,4 +235,20 @@ func (p *provider) Send(messageData []byte, queueName string) (err error) {
 
 	return
 
+}
+
+func (p *provider) Close() (err error) {
+	err = p.Channel.Close()
+
+	if err != nil {
+		return
+	}
+
+	err = p.Connection.Close()
+
+	if err != nil {
+		return
+	}
+
+	return
 }
