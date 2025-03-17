@@ -4,123 +4,94 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
+	"github.com/patrickmn/go-cache"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type provider struct {
-	Address string
+	Address         string
+	Cache           *cache.Cache
+	Connection      *amqp.Connection
+	Channel         *amqp.Channel
+	Consumers       map[string]func([]byte) error
+	ReconnectTicker *time.Ticker
 
-	Connection *amqp.Connection
-	Channel    *amqp.Channel
-
-	Consumers map[string]func([]byte) error
+	consumerCtx    context.Context
+	consumerCancel context.CancelFunc
+	mutex          sync.Mutex // Prevent multiple goroutines reconnecting
 }
 
 type Client interface {
 	Run()
-	Close() (err error)
-
-	Consume(queueName string, consumer func([]byte) error)
-	Send(messageData []byte, queueName string) (err error)
-}
-
-type Connection interface {
 	Close() error
-}
-
-func (p *provider) NewChannel() (err error) {
-	p.Channel, err = p.Connection.Channel()
-
-	if err != nil {
-		return err
-	}
-
-	//go p.AutoConnect(p.Channel.NotifyClose(make(chan *amqp.Error)), p.Channel)
-
-	return nil
+	Consume(queueName string, consumer func([]byte) error)
+	Send(messageData []byte, queueName string) error
 }
 
 func (p *provider) Connect(rmqpAddress string) error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if p.Connection != nil {
+		_ = p.Connection.Close()
+	}
+
 	conn, err := amqp.Dial(rmqpAddress)
 	if err != nil {
 		return err
 	}
 
-	p.Address = rmqpAddress
 	p.Connection = conn
-	conn.Config.Heartbeat = 15 * time.Minute
+	p.Address = rmqpAddress
 
-	go p.AutoConnect(p.Connection.NotifyClose(make(chan *amqp.Error)), p.Connection)
+	p.Connection.Config.Heartbeat = 15 * time.Minute
+
+	if err := p.NewChannel(); err != nil {
+		return err
+	}
+
+	go p.AutoReconnect()
 
 	return nil
 }
 
-func (p *provider) AutoConnect(notifyClose chan *amqp.Error, object Connection) {
-	var err error
-	defer object.Close()
-
+func (p *provider) AutoReconnect() {
 	for {
+		errChan := p.Connection.NotifyClose(make(chan *amqp.Error, 1))
 		select {
-		case reason, ok := <-notifyClose:
-			if !ok {
-				fmt.Println("Connection closed by the developer")
-				return
-			}
+		case reason := <-errChan:
+			if reason != nil {
+				fmt.Println("RabbitMQ connection lost:", reason.Reason)
+				for {
+					time.Sleep(3 * time.Second)
+					fmt.Println("Attempting to reconnect to RabbitMQ...")
 
-			fmt.Println("RabbitMQ connection closed", reason.Reason)
-
-			// Attempt to reconnect
-			for {
-				select {
-				case <-context.Background().Done():
-					fmt.Println("Context canceled, stopping reconnect attempts")
-					return
-				default:
-					fmt.Println("Attempting to reconnect to RabbitMQ")
-
-					err = p.Connect(p.Address)
-
-					err = p.NewChannel()
-					if err == nil {
+					if err := p.Connect(p.Address); err == nil {
 						fmt.Println("Reconnected successfully to RabbitMQ")
 						p.Run()
-
 						return
 					}
-
-					fmt.Println("Reconnect failed, retrying")
-					time.Sleep(time.Second * 3)
 				}
 			}
-
-		case <-context.Background().Done():
-			fmt.Println("Context canceled, stopping reconnect attempts")
-			return
 		}
 	}
 }
 
-func NewClient(rmqpAddress string) (Client, error) {
-	client := &provider{
-		Consumers: make(map[string]func([]byte) error, 0),
+func (p *provider) NewChannel() error {
+	if p.Channel != nil {
+		_ = p.Channel.Close()
 	}
-	var err error
 
-	err = client.Connect(rmqpAddress)
-
+	ch, err := p.Connection.Channel()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	err = client.NewChannel()
-
-	if err != nil {
-		return nil, err
-	}
-
-	return client, nil
+	p.Channel = ch
+	return nil
 }
 
 func (p *provider) Consume(queueName string, consumer func([]byte) error) {
@@ -128,127 +99,136 @@ func (p *provider) Consume(queueName string, consumer func([]byte) error) {
 }
 
 func (p *provider) Run() {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	// Stop existing consumers before restarting
+	if p.consumerCancel != nil {
+		p.consumerCancel()
+	}
+
+	p.consumerCtx, p.consumerCancel = context.WithCancel(context.Background())
 
 	for queueName, consumerFunc := range p.Consumers {
-		q, err := p.Channel.QueueDeclare(
-			queueName, // name
-			false,     // durable
-			false,     // delete when unused
-			false,     // exclusive
-			false,     // no-wait
-			nil,       // arguments
-		)
-		if err != nil {
-			log.Fatal("Failed to declare a queue")
-		}
-
-		msgs, err := p.Channel.Consume(
-			q.Name, // queue
-			"",     // consumer
-			false,  // auto-ack (set to false for manual acknowledgment)
-			false,  // exclusive
-			false,  // no-local
-			false,  // no-wait
-			nil,    // args
-		)
-		if err != nil {
-			log.Fatal("Failed to register a consumer")
-		}
-
-		fmt.Println("waiting for", queueName)
-
-		go func(queueName string, consumerFunc func([]byte) error) {
-			for msg := range msgs {
-				if err := processMessage(p.Channel, msg, consumerFunc); err != nil {
-					if err := republishMessage(p.Channel, msg, queueName); err != nil {
-						log.Printf("Failed to republish message from queue %s", queueName)
-					}
-				}
-			}
-		}(queueName, consumerFunc)
+		go p.startConsumer(queueName, consumerFunc)
 	}
 
-	// Keep the application running to listen for messages
-	select {}
-}
+	// Ticker for restarting RabbitMQ connection and consumers every 10 minutes
+	go func() {
+		for range p.ReconnectTicker.C {
+			fmt.Println("Restarting RabbitMQ connection and consumers")
 
-func processMessage(ch *amqp.Channel, msg amqp.Delivery, consumerFunc func([]byte) error) error {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("Recovered in processMessage: %v", r)
+			if err := p.NewChannel(); err != nil {
+				log.Printf("Failed to create a new channel: %v", err)
+				continue
+			}
+
+			p.Run() // Restart consumers
 		}
 	}()
+}
 
-	err := consumerFunc(msg.Body)
-
+func (p *provider) startConsumer(queueName string, consumerFunc func([]byte) error) {
+	q, err := p.Channel.QueueDeclare(
+		queueName, false, false, false, false, nil,
+	)
 	if err != nil {
-		return err
-	} else {
-		return ch.Ack(msg.DeliveryTag, false)
+		log.Printf("Failed to declare queue %s: %v", queueName, err)
+		return
+	}
+
+	msgs, err := p.Channel.Consume(
+		q.Name, "", true, false, false, false, nil,
+	)
+	if err != nil {
+		log.Printf("Failed to register consumer for queue %s: %v", queueName, err)
+		return
+	}
+
+	fmt.Println("Listening on queue:", queueName)
+
+	for {
+		select {
+		case <-p.consumerCtx.Done():
+			fmt.Println("Stopping consumer for", queueName)
+			return
+		case msg, ok := <-msgs:
+			if !ok {
+				fmt.Println("Consumer channel closed for", queueName)
+				return
+			}
+
+			if err := consumerFunc(msg.Body); err != nil {
+				_ = republishMessage(p.Channel, msg, queueName, err)
+			}
+		}
 	}
 }
 
-func republishMessage(ch *amqp.Channel, msg amqp.Delivery, queueName string) error {
-
-	return ch.PublishWithContext(context.Background(),
-		"",        // exchange
-		queueName, // routing key
-		false,     // mandatory
-		false,     // immediate
-		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        msg.Body,
-		})
-}
-
-func (p *provider) Send(messageData []byte, queueName string) (err error) {
-
-	q, err := p.Channel.QueueDeclare(
-		queueName, // name
-		false,     // durable
-		false,     // delete when unused
-		false,     // exclusive
-		false,     // no-wait
-		nil,       // arguments
-	)
-
+func (p *provider) Send(messageData []byte, queueName string) error {
+	q, err := p.Channel.QueueDeclare(queueName, false, false, false, false, nil)
 	if err != nil {
-		return
+		return err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	err = p.Channel.PublishWithContext(ctx,
-		"",     // exchange
-		q.Name, // routing key
-		false,  // mandatory
-		false,  // immediate
-		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        messageData,
-		})
-
-	if err != nil {
-		return
-	}
-
-	return
-
+	return p.Channel.PublishWithContext(ctx, "", q.Name, false, false, amqp.Publishing{
+		ContentType: "application/json",
+		Body:        messageData,
+	})
 }
 
-func (p *provider) Close() (err error) {
-	err = p.Channel.Close()
-
-	if err != nil {
-		return
+func republishMessage(ch *amqp.Channel, msg amqp.Delivery, queueName string, err error) error {
+	q, err2 := ch.QueueDeclare("error_"+queueName, false, false, false, false, nil)
+	if err2 != nil {
+		return err2
 	}
 
-	err = p.Connection.Close()
+	return ch.PublishWithContext(context.Background(), "", q.Name, false, false, amqp.Publishing{
+		ContentType: "application/json",
+		Body:        msg.Body,
+		Headers: map[string]interface{}{
+			"error": err.Error(),
+		},
+	})
+}
 
-	if err != nil {
-		return
+func (p *provider) Close() error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if p.consumerCancel != nil {
+		p.consumerCancel()
 	}
 
-	return
+	if p.ReconnectTicker != nil {
+		p.ReconnectTicker.Stop()
+	}
+
+	if p.Channel != nil {
+		_ = p.Channel.Close()
+	}
+
+	if p.Connection != nil {
+		return p.Connection.Close()
+	}
+
+	return nil
+}
+
+func NewClient(rmqpAddress string) (Client, error) {
+	client := &provider{
+		Consumers:       make(map[string]func([]byte) error),
+		ReconnectTicker: time.NewTicker(10 * time.Minute),
+	}
+
+	if err := client.Connect(rmqpAddress); err != nil {
+		return nil, err
+	}
+
+	client.Cache = cache.New(5*time.Minute, 10*time.Minute)
+
+	return client, nil
 }
